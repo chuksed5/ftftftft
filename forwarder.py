@@ -3,11 +3,18 @@ import re
 import asyncio
 import logging
 from datetime import datetime
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 import threading
 import time
+
+# Load environment variables from .env file if it exists
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("python-dotenv not installed. Using system environment variables only.")
 
 # Configure logging
 logging.basicConfig(
@@ -16,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Flask app for health checks (equivalent to Express server)
+# Flask app for health checks
 app = Flask(__name__)
 PORT = int(os.environ.get('PORT', 3000))
 
@@ -34,8 +41,8 @@ if not all([BOT_TOKEN, SOURCE_GROUP_ID, TARGET_CHANNEL_ID]):
     exit(1)
 
 # Global variables
-telegram_app = None
 start_time = time.time()
+bot_running = False
 
 # Signal patterns to match
 SIGNAL_PATTERNS = [
@@ -48,7 +55,7 @@ SIGNAL_PATTERNS = [
     re.compile(r'Volatility.*Index.*(BUY|SELL) Signal', re.IGNORECASE),
 ]
 
-# Flask routes for health checking
+# Flask routes
 @app.route('/')
 def home():
     uptime = time.time() - start_time
@@ -57,7 +64,7 @@ def home():
         'uptime': uptime,
         'timestamp': datetime.now().isoformat(),
         'bot_info': {
-            'polling': telegram_app is not None and telegram_app.running,
+            'polling': bot_running,
             'source_group': SOURCE_GROUP_ID,
             'target_channel': TARGET_CHANNEL_ID
         }
@@ -68,14 +75,13 @@ def health():
     uptime = time.time() - start_time
     return jsonify({
         'status': 'healthy',
-        'bot_running': telegram_app is not None and telegram_app.running,
+        'bot_running': bot_running,
         'uptime': uptime
     })
 
 @app.route('/restart', methods=['GET', 'POST'])
 def restart():
     logger.info('🔄 Manual restart requested')
-    # In production, you might want to implement actual restart logic
     return jsonify({'message': 'Bot restart initiated'})
 
 def contains_signal(text):
@@ -87,14 +93,12 @@ def contains_signal(text):
 async def forward_signal(message_text, context: ContextTypes.DEFAULT_TYPE):
     """Forward trading signal to target channel"""
     try:
-        # Create formatted message
         formatted_message = (
             f"🔥 TRADING SIGNAL 🔥\n\n"
             f"{message_text}\n\n"
             f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         
-        # Send to channel
         await context.bot.send_message(
             chat_id=TARGET_CHANNEL_ID,
             text=formatted_message
@@ -107,13 +111,11 @@ async def forward_signal(message_text, context: ContextTypes.DEFAULT_TYPE):
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming messages"""
     try:
-        # Only process messages from the source group
         if str(update.effective_chat.id) != SOURCE_GROUP_ID:
             return
         
         message_text = update.message.text or update.message.caption or ''
         
-        # Check if message contains trading signals
         if contains_signal(message_text):
             logger.info(f'🎯 Trading signal detected: {message_text[:100]}...')
             await forward_signal(message_text, context)
@@ -126,7 +128,7 @@ async def test_channel_access(application):
     try:
         await application.bot.send_message(
             chat_id=TARGET_CHANNEL_ID,
-            text='🤖 Bot deployed and running on Render!'
+            text='🤖 Bot deployed and running!'
         )
         logger.info('✅ Bot can access the target channel!')
     except Exception as error:
@@ -141,61 +143,96 @@ def run_flask():
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
 
 async def main():
-    """Main function to run the bot"""
-    global telegram_app
+    """Main async function to run the bot"""
+    global bot_running
     
     logger.info('🔧 Initializing bot...')
     
     # Create the Application
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
-    telegram_app.add_handler(MessageHandler(filters.ALL, message_handler))
-    telegram_app.add_error_handler(error_handler)
+    application.add_handler(MessageHandler(filters.ALL, message_handler))
+    application.add_error_handler(error_handler)
     
     try:
+        # Initialize the application
+        await application.initialize()
+        
         # Get bot info
-        bot_info = await telegram_app.bot.get_me()
+        bot_info = await application.bot.get_me()
+        
         logger.info('🤖 Trading Signal Bot started!')
         logger.info(f'📋 Bot Info: @{bot_info.username}')
         logger.info(f'👥 Monitoring group: {SOURCE_GROUP_ID}')
         logger.info(f'📢 Forwarding to channel: {TARGET_CHANNEL_ID}')
         
-        # Test channel access after a delay
-        asyncio.create_task(asyncio.sleep(3))
-        asyncio.create_task(test_channel_access(telegram_app))
+        # Start the application
+        await application.start()
         
-        # Start the bot
+        # Test channel access
+        await asyncio.sleep(3)
+        await test_channel_access(application)
+        
+        # Start polling
         logger.info('🚀 Starting bot polling...')
-        await telegram_app.run_polling(
+        bot_running = True
+        
+        # Use start_polling instead of run_polling for async context
+        await application.updater.start_polling(
             poll_interval=0.3,
             timeout=10,
             bootstrap_retries=5,
-            read_timeout=30,
-            write_timeout=30,
-            connect_timeout=30,
-            pool_timeout=30
+            drop_pending_updates=True
         )
         
+        # Keep the bot running
+        logger.info('✅ Bot is now running and listening for messages...')
+        while bot_running:
+            await asyncio.sleep(1)
+            
     except Exception as error:
-        logger.error(f'❌ Failed to start bot: {error}')
-        raise
+        logger.error(f'❌ Bot error: {error}')
+        bot_running = False
+    finally:
+        # Clean shutdown
+        try:
+            if application.updater.running:
+                await application.updater.stop()
+            await application.stop()
+            await application.shutdown()
+            logger.info('🔄 Bot shutdown complete')
+        except Exception as e:
+            logger.error(f'❌ Error during shutdown: {e}')
+        bot_running = False
 
-if __name__ == '__main__':
-    # Start Flask server in a separate thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    
-    logger.info(f'🌐 Server running on port {PORT}')
-    
-    # Wait a bit for Flask to start
-    time.sleep(2)
-    
-    # Run the bot
+def run_bot():
+    """Run the bot in a separate thread with its own event loop"""
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info('\n🛑 Bot shutting down...')
     except Exception as e:
         logger.error(f'❌ Bot crashed: {e}')
-        exit(1)
+    finally:
+        global bot_running
+        bot_running = False
+
+if __name__ == '__main__':
+    # Start Flask server in daemon thread
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    logger.info(f'🌐 Server running on port {PORT}')
+    time.sleep(2)  # Give Flask time to start
+    
+    # Run the telegram bot in a separate thread
+    bot_thread = threading.Thread(target=run_bot, daemon=False)
+    bot_thread.start()
+    
+    try:
+        # Keep the main thread alive
+        bot_thread.join()
+    except KeyboardInterrupt:
+        logger.info('\n🛑 Shutting down...')
+        bot_running = False
