@@ -141,7 +141,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def run_flask():
     """Run Flask server in a separate thread"""
     app.run(host='0.0.0.0', port=PORT, debug=False, use_reloader=False)
-
+    
+            
 async def main():
     global bot_running
     
@@ -160,9 +161,6 @@ async def main():
             await application.initialize()
             await application.start()
             
-            # Start background tasks
-            asyncio.create_task(heartbeat(application))
-            asyncio.create_task(memory_cleaner())
             
             bot_info = await application.bot.get_me()
             logger.info(f'🤖 Bot @{bot_info.username} started successfully')
